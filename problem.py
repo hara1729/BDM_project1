@@ -767,7 +767,7 @@ class Problem:
             print(f"\nPerformance for Top {idx + 1} Parameters (Using Stemmed text:")
             print(classification_report(df_test["binary_category"], predictions))
 
-    def Q9(self):
+    def Q11(self):
         fit_on = "clean_text"
 
         word_embeddings = self._load_glove_embeddings()
