@@ -10,6 +10,8 @@ from sklearn.pipeline import Pipeline
 import numpy as np
 import matplotlib.pyplot as plt
 
+import scipy
+
 import nltk
 from nltk.stem import WordNetLemmatizer, PorterStemmer
 from nltk.tokenize import word_tokenize
@@ -22,7 +24,7 @@ import warnings
 import sys
 
 from typing import List, Union, Optional
-from typeguard import check_type
+from typeguard import check_type, typechecked
 
 warnings.filterwarnings("ignore")
 
@@ -61,11 +63,12 @@ def categorical_labels(category):
         sys.exit(f"Invalid category {category} found")
 
 
-
+@typechecked
 class Problem:
-    def __init__(self, path_to_csv, random_state = 42):
+    def __init__(self, path_to_csv, path_to_glove_txt, random_state = 42):
         self.random_state = random_state
         self._get_dataframes(path_to_csv)
+        self.path_to_glove_txt = path_to_glove_txt
 
     def _get_dataframes(self, path):
         df = pd.read_csv(path)
@@ -86,6 +89,8 @@ class Problem:
                                                                        test_size = 0.2,
                                                                        random_state = self.random_state)
 
+        self.df = df
+    
     def _do_tfidf(self, fit_on: Optional[str] = "clean_text", min_df: Optional[int] = 3):
         check_type(fit_on, Optional[str])
         check_type(min_df, Optional[int])
@@ -115,6 +120,7 @@ class Problem:
             (train_X_tfidf, _), _ = self._do_tfidf(fit_on = fit_on, min_df = 3)
         else:
             train_X_tfidf = tfidf_features
+            print(train_X_tfidf.shape)
         
         lsi = TruncatedSVD(n_components = n_components, random_state = self.random_state)
         U_sigma = lsi.fit_transform(train_X_tfidf)
@@ -154,6 +160,7 @@ class Problem:
             (train_X_tfidf, _), _ = self._do_tfidf(fit_on = fit_on, min_df = 3)
         else:
             train_X_tfidf = tfidf_features
+            print(train_X_tfidf.shape)
         
         if fit_on == "clean_text":
             df_train, df_test = self.train_df_clean, self.test_df_clean
@@ -172,8 +179,8 @@ class Problem:
         return lsi_object, svm
     
     def _predict_SVM(self, svm, lsi_object, 
-                           X_test: Union[str, np.ndarray], 
-                           y_test: Union[str, np.ndarray], 
+                           X_test: Union[str, np.ndarray, scipy.sparse._csr.csr_matrix], 
+                           y_test: Union[str, np.ndarray, pd.core.series.Series], 
                            roc: bool = False):
         
         if isinstance(X_test, str):
@@ -230,8 +237,8 @@ class Problem:
         return lsi_object, regressor
 
     def _predict_logistic_classifier(self, regressor, lsi_object,
-                                           X_test: Union[str, np.ndarray], 
-                                           y_test: Union[str, np.ndarray], 
+                                           X_test: Union[str, np.ndarray, scipy.sparse._csr.csr_matrix], 
+                                           y_test: Union[str, np.ndarray, pd.core.series.Series], 
                                            roc: bool = False):
 
         if isinstance(X_test, str):
@@ -286,8 +293,8 @@ class Problem:
 
     
     def _predict_naiveBayes(self, clf, lsi_object,
-                                  X_test: Union[str, np.ndarray], 
-                                  y_test: Union[str, np.ndarray], 
+                                  X_test: Union[str, np.ndarray, scipy.sparse._csr.csr_matrix], 
+                                  y_test: Union[str, np.ndarray, pd.core.series.Series], 
                                   roc: bool = False):
         
         if isinstance(X_test, str):
@@ -315,7 +322,63 @@ class Problem:
 
         return report, conf_matrix, [tpr, fpr, roc_auc]
     
+    def _load_glove_embeddings(self):
+        with open(self.path_to_glove_txt, encoding = "utf8") as f:
+            word_embeddings = dict()
+            for line in f:
+                values = line.split(' ')
+                word_embeddings[values[0]] = np.asarray(values[1:], dtype = np.float32)
+        return word_embeddings
     
+    def _get_text_embeddings(self, text, word_embeddings):
+        '''
+        Feature Engineering to get text embeddings from GLoVE embeddings
+        '''
+        if isinstance(text, str):
+            words = text.split()
+        else:
+            words = text
+        embeddings = []
+        for word in words:
+            if word in word_embeddings.keys():
+                embeddings.append(word_embeddings[word])
+        
+        embeddings = np.asarray(embeddings, dtype = np.float32)
+        if embeddings.shape[0] == 0:
+            embeddings = np.random.random([len(words), 300])
+        embeddings = embeddings.reshape([embeddings.shape[0], 10, 30])
+        embeddings = np.mean(embeddings, axis = -1)
+        embeddings = np.max(embeddings, axis = -1)
+
+        # keep the top K = 300 embeddings while maintaining their relative order
+
+        abs_embeddings = np.abs(embeddings)
+        sorted_indices = np.argsort(abs_embeddings)
+        top_indices = sorted_indices[-300:]
+        top_indices = np.sort(top_indices)
+        embeddings = embeddings[top_indices]
+        embeddings = embeddings[..., np.newaxis]
+        print(f"feature shape: {embeddings.shape}")
+        return embeddings.T
+    
+    def _get_max_len(self, df):
+        max_len = 0
+        for arr  in df:
+            if arr.shape[1] > max_len:
+                max_len = arr.shape[1]
+        
+        return max_len
+    
+    def _pad_to_MAX_LEN(self, arr, max_len):
+        padding = [
+                    [0, 0],
+                    [0, max(0, max_len - arr.shape[1])]
+                  ]
+        
+        arr = np.pad(arr, pad_width = padding, mode = "symmetric")
+        norm = np.linalg.norm(arr, axis = 1, keepdims = True)
+                
+        return arr/norm
     
     def Q3(self):
         fit_on = "clean_text"
@@ -330,6 +393,7 @@ class Problem:
         ax.legend()
         ax.set_xlabel(r"min_df $\rightarrow$ ")
         ax.set_ylabel(r"tfidf matrix size $\rightarrow$ ")
+        ax,grid()
         plt.show()
 
     def Q4(self):
@@ -702,13 +766,86 @@ class Problem:
             predictions = pipeline.predict(df_test[fit_on])
             print(f"\nPerformance for Top {idx + 1} Parameters (Using Stemmed text:")
             print(classification_report(df_test["binary_category"], predictions))
+
+    def Q9(self):
+        fit_on = "clean_text"
+
+        word_embeddings = self._load_glove_embeddings()
+
+        if fit_on == "clean_text":
+            df_train, df_test = train_test_split(self.df[["clean_text", "binary_category"]], 
+                                                         test_size = 0.2,
+                                                         random_state = self.random_state)
+        elif fit_on == "lemmatized_text":
+            df_train, df_test = train_test_split(self.df[["lemmatized_text", "binary_category"]], 
+                                                         test_size = 0.2,
+                                                         random_state = self.random_state)
+        elif fit_on == "stemmed_text":
+            df_train, df_test = train_test_split(self.df[["stemmed_text", "binary_category"]], 
+                                                         test_size = 0.2,
+                                                         random_state = self.random_state)
+        elif fit_on == "keywords":
+            df_train, df_test = train_test_split(self.df[["keywords", "binary_category"]], 
+                                                         test_size = 0.2,
+                                                         random_state = self.random_state)
+        else:
+            raise ValueError("Invalid `fit_on`")
+
+        df_train["embeddings"] = df_train[fit_on].apply(self._get_text_embeddings, args = [word_embeddings])
+        df_test["embeddings"] = df_test[fit_on].apply(self._get_text_embeddings, args = [word_embeddings])
+
+        max_len = self._get_max_len(df_train["embeddings"])
+        df_train["embeddings"] = df_train["embeddings"].apply(lambda x: self._pad_to_MAX_LEN(x, max_len))
+
+        max_len = self._get_max_len(df_test["embeddings"])
+        df_test["embeddings"] = df_test["embeddings"].apply(lambda x: self._pad_to_MAX_LEN(x, max_len))
+
+        embeddings = []
+        for emb in df_train["embeddings"]:
+            embeddings.append(emb)
+
+        embeddings = np.squeeze(np.asarray(embeddings))
+
+        lsi, svm = self._fit_SVM(probability = True, 
+                                 tfidf_features = embeddings, 
+                                 fit_on = "lemmatized_text", 
+                                 lsi_num_components = 20)
+        
+        embeddings = []
+        for emb in df_test["embeddings"]:
+            embeddings.append(emb)
+
+        embeddings = np.squeeze(np.asarray(embeddings))
+        
+        report, conf_matrix, [tpr, fpr, roc_auc] = self._predict_SVM(svm = svm, lsi_object = lsi,
+                                                                     X_test = embeddings, y_test = "lemmatized_text", roc = True)
+
+        print('-'*70)
+        print("SVM on Feature Engineered Data")
+        print('-'*70)
+        print(report)
+        print('-'*27, "Confusion Matrix", '-'*25)
+        print(conf_matrix)
+        print('-'*70)
+
+        fig, ax = plt.subplots(1, 1)
+        ax.plot(fpr, tpr, label = 'ROC curve')
+        ax.plot([0, 1], [0, 1], linestyle = '--')
+        ax.set_xlim([-0.01, 1.0])
+        ax.set_ylim([0.0, 1.05])
+        ax.set_xlabel('False Positive Rate')
+        ax.set_ylabel('True Positive Rate')
+        ax.set_title('ROC curve (Feature Enigneered Data)')
+        ax.legend()
+        plt.show()
                                             
 if __name__ == "__main__":
-    prob = Problem(path_to_csv = "./Dataset1.csv")
+    prob = Problem(path_to_csv = "./Dataset1.csv", path_to_glove_txt = "./glove.6B/glove.txt")
     # prob.Q3()
     # prob.Q4()
     # prob.Q5()
     # prob.Q6()
     # prob.Q7()
-    prob.Q8()
+    # prob.Q8()
+    prob.Q9()
     
