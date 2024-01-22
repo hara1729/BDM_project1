@@ -3,12 +3,17 @@ from sklearn.model_selection import train_test_split, GridSearchCV
 from sklearn.svm import SVC
 from sklearn.linear_model import LogisticRegression
 from sklearn.naive_bayes import GaussianNB
-from sklearn.metrics import classification_report, roc_curve, auc, confusion_matrix, accuracy_score
+from sklearn.metrics import classification_report, roc_curve, auc, confusion_matrix, accuracy_score, ConfusionMatrixDisplay
 from sklearn.decomposition import TruncatedSVD, NMF
 from sklearn.pipeline import Pipeline
+from sklearn.exceptions import ConvergenceWarning
+
+import umap
 
 import numpy as np
+import math
 import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap
 
 import scipy
 
@@ -22,11 +27,20 @@ from cleaner import clean
 
 import warnings
 import sys
+import os
 
-from typing import List, Union, Optional
+import ast
+from itertools import combinations
+
+from typing import List, Union, Optional, Iterator, Tuple
 from typeguard import check_type, typechecked
 
 warnings.filterwarnings("ignore")
+warnings.simplefilter('ignore', ConvergenceWarning)
+plt.rcParams.update({
+    "text.usetex": True,
+    "font.family": "Helvetica"
+})
 
 def lemmatize_text(text):
     lemmatizer = WordNetLemmatizer()
@@ -62,13 +76,29 @@ def categorical_labels(category):
     except KeyError:
         sys.exit(f"Invalid category {category} found")
 
+def merge_category(category_label):
+    category_map = {0: 0, 1: 1, 2: 2,
+                    3: 3, 4: 4, 5: 5, 6: 6,
+                    7: 7, 8: 8, 9: 5}
+
+    try:
+        return category_map[category_label]
+    except KeyError:
+        sys.exit(f"Invalid category {category_label} found")
+
+def closest_factors(N):
+    sqrt_N = int(math.sqrt(N))
+
+    for i in range(sqrt_N, 0, -1):
+        if N % i == 0:
+            return (i, N // i)
 
 @typechecked
 class Problem:
-    def __init__(self, path_to_csv, path_to_glove_txt, random_state = 42):
+    def __init__(self, path_to_csv, path_to_glove_300_txt, random_state = 42):
         self.random_state = random_state
         self._get_dataframes(path_to_csv)
-        self.path_to_glove_txt = path_to_glove_txt
+        self.path_to_glove_300_txt = path_to_glove_300_txt
 
     def _get_dataframes(self, path):
         df = pd.read_csv(path)
@@ -77,24 +107,23 @@ class Problem:
         df['stemmed_text'] = df['clean_text'].apply(stem_text)
         df['binary_category'] = df['root_label'].apply(category_to_binary)
         df['leaf_category'] = df['leaf_label'].apply(categorical_labels)
+
+        train_df, test_df = train_test_split(df, test_size = 0.2, random_state = self.random_state)
         
-        self.train_df_clean, self.test_df_clean = train_test_split(df[["clean_text", "binary_category"]], 
+        self.train_df_clean, self.test_df_clean = train_test_split(df[["clean_text", "binary_category", "leaf_category"]], 
                                                                    test_size = 0.2, 
                                                                    random_state = self.random_state)
-        self.train_df_lemmatized, self.test_df_lemmatized = train_test_split(df[["lemmatized_text", "binary_category"]], 
+        self.train_df_lemmatized, self.test_df_lemmatized = train_test_split(df[["lemmatized_text", "binary_category", "leaf_category"]], 
                                                                              test_size = 0.2,
                                                                              random_state = self.random_state)
         
-        self.train_df_stemmed, self.test_df_stemmed = train_test_split(df[["stemmed_text", "binary_category"]], 
+        self.train_df_stemmed, self.test_df_stemmed = train_test_split(df[["stemmed_text", "binary_category", "leaf_category"]], 
                                                                        test_size = 0.2,
                                                                        random_state = self.random_state)
 
         self.df = df
     
-    def _do_tfidf(self, fit_on: Optional[str] = "clean_text", min_df: Optional[int] = 3):
-        check_type(fit_on, Optional[str])
-        check_type(min_df, Optional[int])
-
+    def _do_tfidf(self, fit_on: Optional[str] = "clean_text", data: Optional[List[pd.DataFrame]] = None, min_df: Optional[int] = 3):
         assert fit_on in ["clean_text", "lemmatized_text", "stemmed_text"], f"TF-IDF must be learnt on either of [`clean_text`, `lemmatized_text`]"
         assert min_df > 0, f"min_df should be strictly positive. Found {min_df}"
         
@@ -104,6 +133,9 @@ class Problem:
             df_train, df_test = self.train_df_lemmatized, self.test_df_lemmatized
         else:
             df_train, df_test = self.train_df_stemmed, self.test_df_stemmed
+        
+        if data is not None:
+            df_train, df_test = data
 
         vectorizer = CountVectorizer(analyzer = "word", token_pattern = r'\b[^\d\W]+\b', stop_words = "english", min_df = min_df)
         train_X_count = vectorizer.fit_transform(df_train[fit_on])
@@ -115,13 +147,14 @@ class Problem:
 
         return (train_X_tfidf, test_X_tfidf), (train_X_tfidf.shape, test_X_tfidf.shape)
 
+
     def _do_LSI(self, n_components: int, tfidf_features: Optional[np.ndarray] = None, fit_on: Optional[str] = "lemmatized_text"):
         if tfidf_features is None:
             (train_X_tfidf, _), _ = self._do_tfidf(fit_on = fit_on, min_df = 3)
         else:
             train_X_tfidf = tfidf_features
-            print(train_X_tfidf.shape)
-        
+
+
         lsi = TruncatedSVD(n_components = n_components, random_state = self.random_state)
         U_sigma = lsi.fit_transform(train_X_tfidf)
         V_transpose = lsi.components_
@@ -153,6 +186,7 @@ class Problem:
                        probability: Optional[bool] = True,
                        tfidf_features: Optional[np.ndarray] = None,
                        fit_on: Optional[str] = "lemmatized_text",
+                       fit_lsi: Optional[bool] = True,
                        lsi_num_components: Optional[int] = 128,
                        ):
         
@@ -160,7 +194,6 @@ class Problem:
             (train_X_tfidf, _), _ = self._do_tfidf(fit_on = fit_on, min_df = 3)
         else:
             train_X_tfidf = tfidf_features
-            print(train_X_tfidf.shape)
         
         if fit_on == "clean_text":
             df_train, df_test = self.train_df_clean, self.test_df_clean
@@ -169,9 +202,13 @@ class Problem:
         else:
             df_train, df_test = self.train_df_stemmed, self.test_df_stemmed
         
-        lsi_object, X_train_lsi, _, _ = self._do_LSI(n_components = lsi_num_components, 
-                                                     tfidf_features = train_X_tfidf, 
-                                                     fit_on = fit_on)
+        if fit_lsi:
+            lsi_object, X_train_lsi, _, _ = self._do_LSI(n_components = lsi_num_components, 
+                                                        tfidf_features = train_X_tfidf, 
+                                                        fit_on = fit_on)
+        else:
+            lsi_object = None
+            X_train_lsi = train_X_tfidf
 
         svm = SVC(kernel = kernel, C = C, probability = probability, random_state = self.random_state)
         svm.fit(X_train_lsi, df_train["binary_category"])
@@ -194,7 +231,8 @@ class Problem:
             else:
                 y_test = self.test_df_lemmatized["binary_category"]
         
-        X_test = lsi_object.transform(X_test)
+        if lsi_object is not None:
+            X_test = lsi_object.transform(X_test)
         y_pred = svm.predict(X_test)
         report = classification_report(y_test, y_pred)
         conf_matrix = confusion_matrix(y_test, y_pred)
@@ -269,6 +307,7 @@ class Problem:
     
     def _fit_naiveBayes(self, tfidf_features: Optional[np.ndarray] = None,
                               fit_on: Optional[str] = "lemmatized_text",
+                              data_df: Optional[List[pd.DataFrame]] = None,
                               lsi_num_components: Optional[int] = 128):
         if tfidf_features is None:
             (train_X_tfidf, _), _ = self._do_tfidf(fit_on = fit_on, min_df = 3)
@@ -276,11 +315,20 @@ class Problem:
             train_X_tfidf = tfidf_features
         
         if fit_on == "clean_text":
-            df_train, df_test = self.train_df_clean, self.test_df_clean
+            if data_df is None:
+                df_train, df_test = self.train_df_clean, self.test_df_clean
+            else:
+                df_train, df_test = data_df
         elif fit_on == "lemmatized_text":
-            df_train, df_test = self.train_df_lemmatized, self.test_df_lemmatized
+            if data_df is None:
+                df_train, df_test = self.train_df_lemmatized, self.test_df_lemmatized
+            else:
+                df_train, df_test = data_df
         else:
-            df_train, df_test = self.train_df_stemmed, self.test_df_stemmed
+            if data_df is None:
+                df_train, df_test = self.train_df_stemmed, self.test_df_stemmed
+            else:
+                df_train, df_test = data_df
         
         lsi_object, X_train_lsi, _, _ = self._do_LSI(n_components = lsi_num_components, 
                                                      tfidf_features = train_X_tfidf, 
@@ -322,78 +370,90 @@ class Problem:
 
         return report, conf_matrix, [tpr, fpr, roc_auc]
     
-    def _load_glove_embeddings(self):
-        with open(self.path_to_glove_txt, encoding = "utf8") as f:
+    def _load_glove_embeddings(self, path = None):
+        if path is None:
+            path = self.path_to_glove_300_txt
+
+        with open(path, encoding = "utf8") as f:
             word_embeddings = dict()
             for line in f:
                 values = line.split(' ')
                 word_embeddings[values[0]] = np.asarray(values[1:], dtype = np.float32)
         return word_embeddings
     
-    def _get_text_embeddings(self, text, word_embeddings):
+    def _get_text_embeddings(self, text, word_embeddings, embedding_dim = 300, take_top = 300):
         '''
         Feature Engineering to get text embeddings from GLoVE embeddings
         '''
-        if isinstance(text, str):
+        if isinstance(text, str) and not text.startswith('['):
             words = text.split()
+        elif text.startswith('['):
+            words = ast.literal_eval(text)
         else:
-            words = text
+            raise ValueError("Could not parse text")
         embeddings = []
         for word in words:
             if word in word_embeddings.keys():
                 embeddings.append(word_embeddings[word])
         
         embeddings = np.asarray(embeddings, dtype = np.float32)
-        if embeddings.shape[0] == 0:
-            embeddings = np.random.random([len(words), 300])
-        embeddings = embeddings.reshape([embeddings.shape[0], 10, 30])
-        embeddings = np.mean(embeddings, axis = -1)
-        embeddings = np.max(embeddings, axis = -1)
 
-        # keep the top K = 300 embeddings while maintaining their relative order
+        embeddings = np.mean(embeddings, axis = 0)
 
-        abs_embeddings = np.abs(embeddings)
-        sorted_indices = np.argsort(abs_embeddings)
-        top_indices = sorted_indices[-300:]
-        top_indices = np.sort(top_indices)
-        embeddings = embeddings[top_indices]
-        embeddings = embeddings[..., np.newaxis]
-        print(f"feature shape: {embeddings.shape}")
-        return embeddings.T
+        return embeddings
     
-    def _get_max_len(self, df):
-        max_len = 0
-        for arr  in df:
-            if arr.shape[1] > max_len:
-                max_len = arr.shape[1]
-        
-        return max_len
     
-    def _pad_to_MAX_LEN(self, arr, max_len):
-        padding = [
-                    [0, 0],
-                    [0, max(0, max_len - arr.shape[1])]
-                  ]
-        
-        arr = np.pad(arr, pad_width = padding, mode = "symmetric")
-        norm = np.linalg.norm(arr, axis = 1, keepdims = True)
-                
-        return arr/norm
-    
+    def Q1(self):
+        df = self.df.copy()
+        df['alpha_num_count'] = df['full_text'].apply(lambda x: sum(c.isalnum() for c in str(x)))
+
+        plt.figure(figsize=(14, 5))
+        plt.subplot(1, 3, 1)
+        plt.hist(df['alpha_num_count'], bins=20, color='skyblue', edgecolor='black')
+        plt.title(r'Alpha-numeric character count in full\_text')
+        plt.xlabel('Count')
+        plt.ylabel('Frequency')
+
+        plt.subplot(1, 3, 2)
+        df['leaf_label'].value_counts().plot(kind='bar', color='lightgreen', edgecolor='black')
+        plt.title(r'Distribution of leaf\_label')
+        plt.xlabel('Class')
+        plt.ylabel('Frequency')
+
+        plt.subplot(1, 3, 3)
+        df['root_label'].value_counts().plot(kind='bar', color='salmon', edgecolor='black')
+        plt.title(r'Distribution of root\_label')
+        plt.xlabel('Class')
+        plt.ylabel('Frequency')
+
+        plt.tight_layout()
+
+        plt.show()
+
+    def Q2(self):
+        train, test = train_test_split(self.df[["full_text","root_label"]], 
+                                       test_size = 0.2, 
+                                       random_state = self.random_state)
+
+        print(f"[2.] Number of training examples: {train.shape[0]}")
+        print(f"[2.] Number of testing examples: {test.shape[0]}")
+
     def Q3(self):
-        fit_on = "clean_text"
+        fit_on = "lemmatized_text"
         min_dfs = range(1, 11)
         sizes = []
         for min_df in min_dfs:
-            _, (train_X_tfidf_shape, _) = self._do_tfidf(fit_on = fit_on , min_df = min_df)
+            _, (train_X_tfidf_shape, test_X_tfidf_shape) = self._do_tfidf(fit_on = fit_on , min_df = min_df)
             sizes.append(np.prod(train_X_tfidf_shape))
+            if min_df == 3:
+                print(f"train_X_tfidf_shape: {train_X_tfidf_shape}, test_X_tfidf_shape: {test_X_tfidf_shape}")
         
         fig, ax = plt.subplots(1, 1)
-        ax.plot(min_dfs, sizes, marker = 'o', label = "tfidf_matrix_size")
+        ax.plot(min_dfs, sizes, marker = 'o', label = r"tfidf\_matrix\_size")
         ax.legend()
-        ax.set_xlabel(r"min_df $\rightarrow$ ")
+        ax.set_xlabel(r"min\_df $\rightarrow$ ")
         ax.set_ylabel(r"tfidf matrix size $\rightarrow$ ")
-        ax,grid()
+        ax.grid()
         plt.show()
 
     def Q4(self):
@@ -405,7 +465,7 @@ class Problem:
             _, _, explained_variance, _ = self._do_LSI(n_components = n, tfidf_features = train_X_tfidf, fit_on = fit_on)
             explained_variance_ratios.append(explained_variance)
         fig, ax = plt.subplots(1, 1)
-        ax.plot(n_components, explained_variance_ratios, marker = 'o', label = "explained variances\nfor different\nn_components")
+        ax.plot(n_components, explained_variance_ratios, marker = 'o', label = r"explained variances for different n\_components")
         ax.legend()
         ax.set_xlabel(r"num components $\rightarrow$ ")
         ax.set_ylabel(r"explained variance $\rightarrow$ ")
@@ -498,7 +558,7 @@ class Problem:
         print('-'*70)
 
         fig, ax = plt.subplots(1, 1)
-        ax.plot(fpr, tpr, label = r'ROC curve (Hard Margin)($\gamma = 1000 $)')
+        ax.plot(fpr, tpr, label = r'ROC curve (Hard Margin)($\gamma = 100000 $)')
         ax.plot([0, 1], [0, 1], linestyle = '--')
         ax.set_xlim([-0.01, 1.0])
         ax.set_ylim([0.0, 1.05])
@@ -515,6 +575,20 @@ class Problem:
         gs.fit(train_X_tfidf, y)
         C_best = gs.best_params_['C']
         print(r"Best $\gamma$ obtained through grid search: ", C_best)
+        y_pred = gs.best_estimator_.predict(test_X_tfidf)
+        y_true = self.test_df_lemmatized["binary_category"]
+        report = classification_report(y_true, y_pred)
+        conf_matrix = confusion_matrix(y_true, y_pred)
+
+        print('-'*70)
+        print(rf"Best SVM report ($\gamma = {C_best} $):")
+        print('-'*70)
+        print(report)
+        print('-'*27, "Confusion Matrix", '-'*25)
+        print(conf_matrix)
+        print('-'*70)
+
+
 
     def Q6(self):
         fit_on = "lemmatized_text"
@@ -526,6 +600,8 @@ class Problem:
             df_train, df_test = self.train_df_lemmatized, self.test_df_lemmatized
         else:
             df_train, df_test = self.train_df_stemmed, self.test_df_stemmed
+
+        y = df_train["binary_category"]
 
         lsi, regressor = self._fit_logistic_classifier(penalty = None, C = 1e9, 
                                                        tfidf_features = train_X_tfidf, 
@@ -660,20 +736,20 @@ class Problem:
         param_grid = [
                         {
                             'vect__min_df': [3, 5],
-                            'dim_red': [TruncatedSVD(), NMF(max_iter = 1000)],
+                            'dim_red': [TruncatedSVD(), NMF(tol = 0.001, max_iter = 5000)],
                             'dim_red__n_components': [5, 30, 80],
-                            'clf': [SVC(C = 1.0, max_iter = 1000)],
+                            'clf': [SVC(C = 1.0, tol = 0.001, max_iter = 5000)],
                         },
                         {
                             'vect__min_df': [3, 5],
-                            'dim_red': [TruncatedSVD(), NMF(max_iter = 1000)],
+                            'dim_red': [TruncatedSVD(), NMF(tol = 0.001, max_iter = 5000)],
                             'dim_red__n_components': [5, 30, 80],
-                            'clf': [LogisticRegression(C = 1000, solver = 'saga', max_iter = 1000)],
+                            'clf': [LogisticRegression(C = 1000, solver = 'saga', tol = 0.001, max_iter = 5000)],
                             'clf__penalty': ['l1', 'l2'],
                         },
                         {
                             'vect__min_df': [3, 5],
-                            'dim_red': [TruncatedSVD(), NMF(max_iter = 1000)],
+                            'dim_red': [TruncatedSVD(), NMF(tol = 0.001, max_iter = 5000)],
                             'dim_red__n_components': [5, 30, 80],
                             'clf': [GaussianNB()]
                         }
@@ -725,20 +801,20 @@ class Problem:
         param_grid = [
                         {
                             'vect__min_df': [3, 5],
-                            'dim_red': [TruncatedSVD(), NMF(max_iter = 1000)],
+                            'dim_red': [TruncatedSVD(), NMF(tol = 0.001, max_iter = 5000)],
                             'dim_red__n_components': [5, 30, 80],
-                            'clf': [SVC(C = 1.0, max_iter = 1000)],
+                            'clf': [SVC(C = 1.0, tol = 0.001, max_iter = 5000)],
                         },
                         {
                             'vect__min_df': [3, 5],
-                            'dim_red': [TruncatedSVD(), NMF(max_iter = 1000)],
+                            'dim_red': [TruncatedSVD(), NMF(tol = 0.001, max_iter = 5000)],
                             'dim_red__n_components': [5, 30, 80],
-                            'clf': [LogisticRegression(C = 1000, solver = 'saga', max_iter = 1000)],
+                            'clf': [LogisticRegression(C = 1000, solver = 'saga', tol = 0.001, max_iter = 5000)],
                             'clf__penalty': ['l1', 'l2'],
                         },
                         {
                             'vect__min_df': [3, 5],
-                            'dim_red': [TruncatedSVD(), NMF(max_iter = 1000)],
+                            'dim_red': [TruncatedSVD(), NMF(tol = 0.001, max_iter = 5000)],
                             'dim_red__n_components': [5, 30, 80],
                             'clf': [GaussianNB()]
                         }
@@ -764,11 +840,125 @@ class Problem:
             pipeline.set_params(**params)
             pipeline.fit(df_train[fit_on], df_train["binary_category"]) 
             predictions = pipeline.predict(df_test[fit_on])
-            print(f"\nPerformance for Top {idx + 1} Parameters (Using Stemmed text:")
+            print(f"\nPerformance for Top {idx + 1} Parameters (Using Stemmed text):")
             print(classification_report(df_test["binary_category"], predictions))
 
+    
+    def Q9(self):
+        fit_on = "lemmatized_text"
+        (train_X_tfidf, test_X_tfidf), _ = self._do_tfidf(fit_on = fit_on, min_df = 3)
+
+        if fit_on == "clean_text":
+            df_train, df_test = self.train_df_clean, self.test_df_clean
+        elif fit_on == "lemmatized_text":
+            df_train, df_test = self.train_df_lemmatized, self.test_df_lemmatized
+        else:
+            df_train, df_test = self.train_df_stemmed, self.test_df_stemmed
+
+        clf = SVC(decision_function_shape = 'ovo')
+
+        clf.fit(train_X_tfidf, df_train["leaf_category"])
+        y_pred = clf.predict(test_X_tfidf)
+        report = classification_report(df_test["leaf_category"], y_pred)
+        conf_matrix = confusion_matrix(df_test["leaf_category"], y_pred)
+
+        print('-'*70)
+        print("[9] One vs One SVM report:")
+        print('-'*70)
+        print(report)
+        print('-'*27, "Confusion Matrix", '-'*25)
+        print(conf_matrix)
+        print('-'*70)
+
+        disp = ConfusionMatrixDisplay(confusion_matrix = conf_matrix , display_labels=clf.classes_)
+        disp.plot()
+        fig = plt.gcf()
+        fig.suptitle("One vs One SVM Confusion Matrix")
+        plt.show()
+
+        clf = SVC(decision_function_shape = 'ovr', class_weight = 'balanced')
+
+        clf.fit(train_X_tfidf, df_train["leaf_category"])
+        y_pred = clf.predict(test_X_tfidf)
+        report = classification_report(df_test["leaf_category"], y_pred)
+        conf_matrix = confusion_matrix(df_test["leaf_category"], y_pred)
+
+        print('-'*70)
+        print("[9] One vs All SVM report:")
+        print('-'*70)
+        print(report)
+        print('-'*27, "Confusion Matrix", '-'*25)
+        print(conf_matrix)
+        print('-'*70)
+
+        disp = ConfusionMatrixDisplay(confusion_matrix = conf_matrix , display_labels=clf.classes_)
+        disp.plot()
+        fig = plt.gcf()
+        fig.suptitle("One vs All SVM Confusion Matrix")
+        plt.show()
+
+        # ================================== Merging class 9 and 5 ============================================= #
+
+        df_train["leaf_category"] = df_train["leaf_category"].apply(merge_category)
+        df_test["leaf_category"] = df_test["leaf_category"].apply(merge_category)
+
+        clf = SVC(decision_function_shape = 'ovo')
+
+        clf.fit(train_X_tfidf, df_train["leaf_category"])
+        y_pred = clf.predict(test_X_tfidf)
+        report = classification_report(df_test["leaf_category"], y_pred)
+        conf_matrix = confusion_matrix(df_test["leaf_category"], y_pred)
+
+        print('-'*70)
+        print("[9] One vs One SVM report (Class 9 and 5 merged):")
+        print('-'*70)
+        print(report)
+        print('-'*27, "Confusion Matrix", '-'*25)
+        print(conf_matrix)
+        print('-'*70)
+
+        disp = ConfusionMatrixDisplay(confusion_matrix = conf_matrix , display_labels=clf.classes_)
+        disp.plot()
+        fig = plt.gcf()
+        fig.suptitle("One vs One SVM\n(Class 9 and 5 merged)\nConfusion Matrix")
+        plt.show()
+
+        clf = SVC(decision_function_shape = 'ovr', class_weight = 'balanced')
+
+        clf.fit(train_X_tfidf, df_train["leaf_category"])
+        y_pred = clf.predict(test_X_tfidf)
+        report = classification_report(df_test["leaf_category"], y_pred)
+        conf_matrix = confusion_matrix(df_test["leaf_category"], y_pred)
+
+        print('-'*70)
+        print("[9] One vs All SVM report (Class 9 and 5 merged):")
+        print('-'*70)
+        print(report)
+        print('-'*27, "Confusion Matrix", '-'*25)
+        print(conf_matrix)
+        print('-'*70)
+
+        disp = ConfusionMatrixDisplay(confusion_matrix = conf_matrix , display_labels=clf.classes_)
+        disp.plot()
+        fig = plt.gcf()
+        fig.suptitle("One vs All SVM\n(Class 9 and 5 merged)\nConfusion Matrix")
+        plt.show()
+
+    def Q10(self):
+        word_embeddings = self._load_glove_embeddings()
+
+        woman_man = np.linalg.norm(word_embeddings["woman"] - word_embeddings["man"])
+        wife_husband = np.linalg.norm(word_embeddings["wife"] - word_embeddings["husband"])
+        wife_orange = np.linalg.norm(word_embeddings["woman"] - word_embeddings["orange"])
+
+        print(f"[10.] norm(GLoVE['woman'] - GLoVE['man']): {woman_man}")
+        print(f"[10.] norm(GLoVE['wife'] - GLoVE['husband']): {wife_husband}")
+        print(f"[10.] norm(GLoVE['wife'] - GLoVE['orange']): {wife_orange}")
+
+
+
     def Q11(self):
-        fit_on = "clean_text"
+        fit_on = "keywords"
 
         word_embeddings = self._load_glove_embeddings()
 
@@ -794,12 +984,6 @@ class Problem:
         df_train["embeddings"] = df_train[fit_on].apply(self._get_text_embeddings, args = [word_embeddings])
         df_test["embeddings"] = df_test[fit_on].apply(self._get_text_embeddings, args = [word_embeddings])
 
-        max_len = self._get_max_len(df_train["embeddings"])
-        df_train["embeddings"] = df_train["embeddings"].apply(lambda x: self._pad_to_MAX_LEN(x, max_len))
-
-        max_len = self._get_max_len(df_test["embeddings"])
-        df_test["embeddings"] = df_test["embeddings"].apply(lambda x: self._pad_to_MAX_LEN(x, max_len))
-
         embeddings = []
         for emb in df_train["embeddings"]:
             embeddings.append(emb)
@@ -809,7 +993,7 @@ class Problem:
         lsi, svm = self._fit_SVM(probability = True, 
                                  tfidf_features = embeddings, 
                                  fit_on = "lemmatized_text", 
-                                 lsi_num_components = 20)
+                                 fit_lsi = False)
         
         embeddings = []
         for emb in df_test["embeddings"]:
@@ -821,7 +1005,7 @@ class Problem:
                                                                      X_test = embeddings, y_test = "lemmatized_text", roc = True)
 
         print('-'*70)
-        print("SVM on Feature Engineered Data")
+        print("[11.] SVM on Feature Engineered Data")
         print('-'*70)
         print(report)
         print('-'*27, "Confusion Matrix", '-'*25)
@@ -838,14 +1022,147 @@ class Problem:
         ax.set_title('ROC curve (Feature Enigneered Data)')
         ax.legend()
         plt.show()
-                                            
+    
+    def Q12(self, paths_to_glove_embeddings = "./glove.6B/"):
+        '''
+        `path_to_glove_embeddings` is the folder where the glove embeddings are stored.
+        There should be nothing else in this folder besides the glove embeddings. The file names 
+        should be as it is as after the original GLoVE download
+        '''
+        fit_on = "keywords"
+        if fit_on == "clean_text":
+            df_train, df_test = train_test_split(self.df[["clean_text", "binary_category"]], 
+                                                         test_size = 0.2,
+                                                         random_state = self.random_state)
+        elif fit_on == "lemmatized_text":
+            df_train, df_test = train_test_split(self.df[["lemmatized_text", "binary_category"]], 
+                                                         test_size = 0.2,
+                                                         random_state = self.random_state)
+        elif fit_on == "stemmed_text":
+            df_train, df_test = train_test_split(self.df[["stemmed_text", "binary_category"]], 
+                                                         test_size = 0.2,
+                                                         random_state = self.random_state)
+        elif fit_on == "keywords":
+            df_train, df_test = train_test_split(self.df[["keywords", "binary_category"]], 
+                                                         test_size = 0.2,
+                                                         random_state = self.random_state)
+        else:
+            raise ValueError("Invalid `fit_on`")
+
+        glove_files = os.listdir(paths_to_glove_embeddings)
+        embedding_dims = [int(file.split('.')[-2].strip('d')) for file in glove_files]
+        paths = [os.path.join(paths_to_glove_embeddings, file) for file in glove_files]
+
+        y_true = df_test["binary_category"]
+        accuracies = []
+
+        for dim, path in zip(embedding_dims, paths):
+            word_embeddings = self._load_glove_embeddings()
+            print(f"[12. ] Loaded GLoVE {dim}")
+
+            df_train["embeddings"] = df_train[fit_on].apply(self._get_text_embeddings, args = [word_embeddings])
+            df_test["embeddings"] = df_test[fit_on].apply(self._get_text_embeddings, args = [word_embeddings])
+
+            embeddings = []
+            for emb in df_train["embeddings"]:
+                embeddings.append(emb)
+            
+            embeddings = np.squeeze(np.asarray(embeddings))
+
+            _, svm = self._fit_SVM(probability = True, 
+                                   tfidf_features = embeddings, 
+                                   fit_on = "lemmatized_text", 
+                                   fit_lsi = False)
+                
+            embeddings = []
+            
+            for emb in df_test["embeddings"]:
+                embeddings.append(emb)
+
+            embeddings = np.squeeze(np.asarray(embeddings))
+
+            y_pred = svm.predict(embeddings)
+            acc = accuracy_score(y_true, y_pred)
+            accuracies.append(acc)
+
+        fig, ax = plt.subplots(1, 1)
+        ax.plot(embedding_dims, accuracies, color = 'black')
+        ax.set_xlabel(r"embedding dimension $\rightarrow$")
+        ax.set_ylabel(r"Accuracy $\rightarrow$")
+        fig.suptitle("[12. ] Accuracy of SVM for various dimension(s) of GLoVE Embedding")
+        plt.show()
+
+
+    def Q13(self):
+        fit_on = "clean_text"
+        
+        if fit_on == "clean_text":
+            df_train, df_test = train_test_split(self.df[["clean_text", "binary_category"]], 
+                                                         test_size = 0.2,
+                                                         random_state = self.random_state)
+        elif fit_on == "lemmatized_text":
+            df_train, df_test = train_test_split(self.df[["lemmatized_text", "binary_category"]], 
+                                                         test_size = 0.2,
+                                                         random_state = self.random_state)
+        elif fit_on == "stemmed_text":
+            df_train, df_test = train_test_split(self.df[["stemmed_text", "binary_category"]], 
+                                                         test_size = 0.2,
+                                                         random_state = self.random_state)
+        elif fit_on == "keywords":
+            df_train, df_test = train_test_split(self.df[["keywords", "binary_category"]], 
+                                                         test_size = 0.2,
+                                                         random_state = self.random_state)
+        else:
+            raise ValueError("Invalid `fit_on`")
+
+        word_embeddings = self._load_glove_embeddings()
+
+        df_train["embeddings"] = df_train[fit_on].apply(self._get_text_embeddings, args = [word_embeddings])
+
+        embeddings = np.stack(df_train['embeddings'].values)
+        norm = np.linalg.norm(embeddings, axis = 1, keepdims = True)
+        embeddings = np.divide(embeddings, norm)
+        categories = df_train['binary_category'].values
+
+        reducer = umap.UMAP()
+        umap_embeddings = reducer.fit_transform(embeddings)
+
+        color_map = ListedColormap(['orange', 'blue'])
+
+        # Plotting
+        plt.scatter(umap_embeddings[:, 0], umap_embeddings[:, 1], c = categories.astype(bool), cmap = color_map, s = 5)
+        plt.colorbar()
+        plt.title('UMAP Projection of Embeddings')
+        plt.show()
+
+        random_embeddings = np.random.random(embeddings.shape)
+        norm = np.linalg.norm(random_embeddings, axis = 1, keepdims = True)
+        random_embeddings = np.divide(random_embeddings, norm)
+
+        reducer = umap.UMAP()
+        umap_embeddings = reducer.fit_transform(random_embeddings)
+
+        color_map = ListedColormap(['orange', 'blue'])
+
+        # Plotting
+        plt.scatter(umap_embeddings[:, 0], umap_embeddings[:, 1], c = categories.astype(bool), cmap = color_map, s = 5)
+        plt.colorbar()
+        plt.title('UMAP Projection of Random Embeddings')
+        plt.show()
+   
+
 if __name__ == "__main__":
-    prob = Problem(path_to_csv = "./Dataset1.csv", path_to_glove_txt = "./glove.6B/glove.txt")
+    prob = Problem(path_to_csv = "./Dataset1.csv", path_to_glove_300_txt = "./glove.6B/glove.6B.300d.txt")
+    # prob.Q1()
+    # prob.Q2()
     # prob.Q3()
     # prob.Q4()
-    # prob.Q5()
+    prob.Q5()
     # prob.Q6()
     # prob.Q7()
     # prob.Q8()
-    prob.Q9()
-    
+    # prob.Q9()
+    # prob.Q10()
+    # prob.Q11()
+    # prob.Q12(paths_to_glove_embeddings = "./glove.6B/")
+    # prob.Q13()
