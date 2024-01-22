@@ -29,17 +29,31 @@ If you need to wrap this script then follow the steps below for best reproducibi
 
 To see solution(s) for any question in Q1-Q13, do the following
   >>> # create an instance of problem with paths to .csv file and glove.6B.300d.txt
+ 
   >>> prob = Problem(path_to_csv = "./Dataset1.csv", path_to_glove_300_txt = "./glove.6B/glove.6B.300d.txt")
+ 
   >>> prob.Q1()
+ 
   >>> prob.Q2()
+ 
   >>> prob.Q3()
+
   >>> prob.Q4()
+
   >>> prob.Q5()
+
   >>> prob.Q6()
+
   >>> prob.Q7()
+ 
   >>> prob.Q8()
+
   >>> prob.Q9()
+ 
   >>> prob.Q10()
+
   >>> prob.Q11()
-  >>> prob.Q12(paths_to_glove_embeddings = "./glove.6B/") 
+
+  >>> prob.Q12(paths_to_glove_embeddings = "./glove.6B/")
+
   >>> prob.Q13()
