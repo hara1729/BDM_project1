@@ -1050,14 +1050,20 @@ class Problem:
             raise ValueError("Invalid `fit_on`")
 
         glove_files = os.listdir(paths_to_glove_embeddings)
-        embedding_dims = [int(file.split('.')[-2].strip('d')) for file in glove_files]
-        paths = [os.path.join(paths_to_glove_embeddings, file) for file in glove_files]
+        embedding_dims = [int(file.split('.')[-2].strip('d')) for file in glove_files if file.startswith('glove.6B.') and file.endswith('.txt')]
+        paths = [os.path.join(paths_to_glove_embeddings, file) for file in glove_files if file.startswith('glove.6B.') and file.endswith('.txt')]
 
         y_true = df_test["binary_category"]
         accuracies = []
+        paired = sorted(zip(embedding_dims, paths))
+
+        embedding_dims, paths = zip(*paired)
+
+        embedding_dims = list(embedding_dims)
+        paths = list(paths)
 
         for dim, path in zip(embedding_dims, paths):
-            word_embeddings = self._load_glove_embeddings()
+            word_embeddings = self._load_glove_embeddings(path)
             print(f"[12. ] Loaded GLoVE {dim}")
 
             df_train["embeddings"] = df_train[fit_on].apply(self._get_text_embeddings, args = [word_embeddings])
@@ -1157,7 +1163,7 @@ if __name__ == "__main__":
     # prob.Q2()
     # prob.Q3()
     # prob.Q4()
-    prob.Q5()
+    # prob.Q5()
     # prob.Q6()
     # prob.Q7()
     # prob.Q8()
@@ -1165,4 +1171,4 @@ if __name__ == "__main__":
     # prob.Q10()
     # prob.Q11()
     # prob.Q12(paths_to_glove_embeddings = "./glove.6B/")
-    # prob.Q13()
+    prob.Q13()
